@@ -1,0 +1,396 @@
+"""
+Smart Align Pro - Unified Snap Solver Core  v7.5.5
+Item 8: merged CAD snap + quick snap solver.
+
+All operators (two_point, three_point, cad_snap, quick_snap) share this
+single resolution pipeline:
+
+    fresh_hit  →  current_hover  →  sticky_hit  →  last_valid_hit
+
+Public API:
+    SnapResult        - lightweight dataclass carrying resolved snap info
+    SnapSolverMixin   - mixin class for operators; provides the 4-level chain
+    snap_solver_core  - module-level singleton with shared radius tables
+"""
+
+import math
+from math import hypot
+from typing import Optional, Tuple, Dict, Any
+
+import bpy
+from bpy_extras import view3d_utils
+from mathutils import Vector
+
+
+# ─────────────────────────────────────────────────────────────
+# SnapResult  (replaces both dict-hits and SnapCandidate)
+# ─────────────────────────────────────────────────────────────
+
+class SnapResult:
+    """
+    Unified snap result used by every operator.
+    Bridges the dict-hit style (alignment_operators) and the
+    SnapCandidate style (cad_operators / snap_engine).
+    """
+    __slots__ = (
+        "location", "snap_location", "snap_type",
+        "normal", "face_index", "object", "matrix",
+        "screen_distance", "score",
+    )
+
+    def __init__(
+        self,
+        location: Vector,
+        snap_location: Optional[Vector] = None,
+        snap_type: str = "RAY",
+        normal: Optional[Vector] = None,
+        face_index: int = -1,
+        obj=None,
+        matrix=None,
+        screen_distance: float = 0.0,
+        score: float = 0.0,
+    ):
+        self.location        = location
+        self.snap_location   = snap_location if snap_location is not None else location
+        self.snap_type       = snap_type
+        self.normal          = normal or Vector((0, 0, 1))
+        self.face_index      = face_index
+        self.object          = obj
+        self.matrix          = matrix
+        self.screen_distance = screen_distance
+        self.score           = score
+
+    @property
+    def is_non_ray(self) -> bool:
+        return (self.snap_type or "RAY").upper() != "RAY"
+
+    def as_dict(self) -> dict:
+        """Back-compat: return dict used by alignment_operators helpers."""
+        return {
+            "location":      self.location,
+            "snap_location": self.snap_location,
+            "snap_type":     self.snap_type,
+            "normal":        self.normal,
+            "face_index":    self.face_index,
+            "object":        self.object,
+            "matrix":        self.matrix,
+            "screen_distance": self.screen_distance,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "SnapResult":
+        """Build from legacy dict-hit produced by alignment_operators."""
+        return SnapResult(
+            location      = d.get("location", Vector()),
+            snap_location = d.get("snap_location"),
+            snap_type     = d.get("snap_type", "RAY"),
+            normal        = d.get("normal"),
+            face_index    = d.get("face_index", -1),
+            obj           = d.get("object"),
+            matrix        = d.get("matrix"),
+            screen_distance = d.get("screen_distance", 0.0),
+        )
+
+    @staticmethod
+    def from_candidate(c) -> "SnapResult":
+        """Build from legacy SnapCandidate (snap_engine.py)."""
+        return SnapResult(
+            location        = c.location,
+            snap_location   = c.location,
+            snap_type       = getattr(c, "snap_type", "RAY"),
+            obj             = getattr(c, "object", None),
+            screen_distance = getattr(c, "screen_distance", 0.0),
+            score           = getattr(c, "score", 0.0),
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# Snap radius / type tables  (shared config)
+# ─────────────────────────────────────────────────────────────
+
+# Snap radii in screen pixels (×1.5 over legacy values for better feel)
+SNAP_RADII: Dict[str, float] = {
+    "VERTEX":      30.0,
+    "MIDPOINT":    27.0,
+    "EDGE":        21.0,
+    "FACE_CENTER": 33.0,
+    "FACE":        39.0,
+    "ORIGIN":      36.0,
+    "CENTER":      36.0,
+    "RAY":         0.0,
+}
+
+# Sticky release radii — how far the cursor must travel before sticky breaks
+STICKY_RADII: Dict[str, float] = {
+    "VERTEX":      48.0,
+    "MIDPOINT":    48.0,
+    "EDGE":        52.0,
+    "FACE_CENTER": 56.0,
+    "FACE":        56.0,
+    "ORIGIN":      60.0,
+    "CENTER":      60.0,
+    "RAY":         32.0,
+}
+
+# Snap type priority weights (used for scoring)
+TYPE_WEIGHTS: Dict[str, float] = {
+    "VERTEX":      1.00,
+    "MIDPOINT":    0.90,
+    "ORIGIN":      0.85,
+    "EDGE":        0.75,
+    "FACE_CENTER": 0.65,
+    "CENTER":      0.65,
+    "FACE":        0.50,
+    "RAY":         0.10,
+}
+
+# Snap influence radius multipliers (for overlay visualization item 5)
+INFLUENCE_RADIUS_LIVE:    float = 1.0   # full radius
+INFLUENCE_RADIUS_STICKY:  float = 1.5   # sticky larger
+INFLUENCE_RADIUS_CONFIRM: float = 0.8   # confirm zone tighter
+
+
+def snap_radius_for(snap_type: str) -> float:
+    return SNAP_RADII.get((snap_type or "RAY").upper(), 30.0)
+
+
+def sticky_radius_for(snap_type: str) -> float:
+    return STICKY_RADII.get((snap_type or "RAY").upper(), 48.0)
+
+
+def screen_distance(context, location: Vector, mouse_x: float, mouse_y: float) -> float:
+    """Shared screen-distance utility."""
+    try:
+        region = context.region
+        rv3d   = getattr(context.space_data, "region_3d", None)
+        if region is None or rv3d is None:
+            return float("inf")
+        pt2d = view3d_utils.location_3d_to_region_2d(region, rv3d, location)
+        if pt2d is None:
+            return float("inf")
+        return hypot(pt2d.x - mouse_x, pt2d.y - mouse_y)
+    except Exception:
+        return float("inf")
+
+
+# ─────────────────────────────────────────────────────────────
+# Core solver singleton
+# ─────────────────────────────────────────────────────────────
+
+class _SnapSolverCore:
+    """
+    Module-level singleton.  Stateless — all per-operator state lives on
+    the operator (via SnapSolverMixin).
+    """
+
+    def score(self, result: SnapResult, mouse_x: float, mouse_y: float) -> float:
+        """Score a SnapResult: higher = better."""
+        snap_type = (result.snap_type or "RAY").upper()
+        radius    = snap_radius_for(snap_type)
+        if radius <= 0:
+            return 0.0
+        distance_score = max(0.0, 1.0 - (result.screen_distance / radius) ** 1.5)
+        weight         = TYPE_WEIGHTS.get(snap_type, 0.5)
+        proximity_bonus = max(0.0, 1.0 - result.screen_distance / 30.0) * 0.2
+        return (distance_score * weight) + proximity_bonus
+
+    def filter_by_snap_type(self, result: SnapResult, allowed: str) -> bool:
+        """Return True if result.snap_type satisfies the allowed filter."""
+        allowed = (allowed or "ALL").upper()
+        if allowed == "ALL":
+            return True
+        rt = (result.snap_type or "RAY").upper()
+        expanded = {allowed}
+        if allowed == "MIDPOINT":
+            expanded.update({"MIDPOINT", "EDGE_MID", "EDGE_MIDDLE"})
+        elif allowed == "CENTER":
+            expanded.update({"CENTER", "ORIGIN", "OBJECT", "FACE_CENTER"})
+        elif allowed == "FACE":
+            expanded.update({"FACE", "FACE_CENTER"})
+        return rt in expanded
+
+
+snap_solver_core = _SnapSolverCore()
+
+
+# ─────────────────────────────────────────────────────────────
+# SnapSolverMixin — operator mixin for the 4-level chain
+# ─────────────────────────────────────────────────────────────
+
+class SnapSolverMixin:
+    """
+    Mix into any Blender Operator to get the unified 4-level snap chain:
+
+        fresh  >  current  >  sticky  >  last_valid
+
+    The mixin manages its own state fields; call init_snap_state() in
+    invoke() and reset_snap_state() after confirmation.
+
+    Compatible with both dict-hit (alignment_operators style) and
+    SnapResult / SnapCandidate style.
+    """
+
+    # ── public API ────────────────────────────────────────────
+
+    def init_snap_state(self):
+        """Call in invoke() to initialise all state fields."""
+        # 1. fresh: produced each MOUSEMOVE by the operator itself
+        self._snap_fresh:        Optional[SnapResult] = None
+        # 2. current: last fresh hit that landed on expected object
+        self._snap_current:      Optional[SnapResult] = None
+        # 3. sticky: last non-RAY hit, persists after cursor leaves geometry
+        self._snap_sticky:       Optional[SnapResult] = None
+        self._snap_sticky_stage: Optional[str]        = None
+        self._snap_sticky_mode:  Optional[str]        = None   # FROM/TO/stage key
+        self._snap_sticky_xy:    Optional[Tuple[float, float]] = None
+        # 4. last_valid: absolute last non-RAY hit ever, never cleared until confirm
+        self._snap_last_valid:   Optional[SnapResult] = None
+        # snap type filter (for cad operators)
+        self._snap_type_filter:  str = "ALL"
+        # state tracking
+        self._snap_state: str = "IDLE"   # IDLE / HOVER / LIVE_SNAP / STICKY_SNAP / CONFIRM_READY / CONFIRMED
+
+    def store_fresh(self, result: SnapResult, stage_or_mode: str, event):
+        """
+        Feed the latest MOUSEMOVE hit into the chain.
+        Updates current, sticky, last_valid as appropriate.
+        Also advances the selector state machine.
+        """
+        self._snap_fresh = result
+
+        if result is None:
+            self._snap_current = None
+            if self._snap_sticky is not None:
+                self._snap_state = "STICKY_SNAP"
+            else:
+                self._snap_state = "HOVER"
+            return
+
+        # current
+        self._snap_current = result
+
+        # sticky + last_valid: only non-RAY
+        if result.is_non_ray:
+            sticky = SnapResult(
+                location      = Vector(result.location),
+                snap_location = Vector(result.snap_location),
+                snap_type     = result.snap_type,
+                normal        = Vector(result.normal),
+                face_index    = result.face_index,
+                obj           = result.object,
+                matrix        = result.matrix,
+                screen_distance = result.screen_distance,
+                score         = result.score,
+            )
+            self._snap_sticky       = sticky
+            self._snap_sticky_stage = stage_or_mode
+            self._snap_sticky_mode  = stage_or_mode
+            self._snap_sticky_xy    = (
+                getattr(event, "mouse_region_x", 0),
+                getattr(event, "mouse_region_y", 0),
+            ) if event else None
+            self._snap_last_valid   = sticky
+            self._snap_state = "LIVE_SNAP"
+        else:
+            self._snap_state = "HOVER"
+
+    def get_effective(
+        self,
+        stage_or_mode: str,
+        snap_type_filter: str = "ALL",
+    ) -> Tuple[Optional[SnapResult], str]:
+        """
+        Return (best_result, source_tag) where source_tag is one of:
+            "fresh"  /  "current"  /  "sticky"  /  "last_valid"  /  "none"
+
+        Applies snap_type_filter before returning sticky / last_valid.
+        """
+        # 1. fresh
+        if self._snap_fresh is not None:
+            if snap_solver_core.filter_by_snap_type(self._snap_fresh, snap_type_filter):
+                return self._snap_fresh, "fresh"
+
+        # 2. current
+        if self._snap_current is not None:
+            if snap_solver_core.filter_by_snap_type(self._snap_current, snap_type_filter):
+                return self._snap_current, "current"
+
+        # 3. sticky — must match stage/mode
+        if (
+            self._snap_sticky is not None
+            and self._snap_sticky_stage == stage_or_mode
+            and snap_solver_core.filter_by_snap_type(self._snap_sticky, snap_type_filter)
+        ):
+            self._snap_state = "STICKY_SNAP"
+            return self._snap_sticky, "sticky"
+
+        # 4. last_valid — fallback of last resort
+        if (
+            self._snap_last_valid is not None
+            and snap_solver_core.filter_by_snap_type(self._snap_last_valid, snap_type_filter)
+        ):
+            self._snap_state = "STICKY_SNAP"
+            return self._snap_last_valid, "last_valid"
+
+        self._snap_state = "HOVER"
+        return None, "none"
+
+    def confirm_snap(self):
+        """Call after user confirms (LEFTMOUSE). Advances to CONFIRMED, resets sticky/current."""
+        self._snap_state   = "CONFIRMED"
+        self._snap_fresh   = None
+        self._snap_current = None
+        self._snap_sticky  = None
+        self._snap_sticky_stage = None
+        self._snap_sticky_mode  = None
+        self._snap_sticky_xy    = None
+        # last_valid deliberately preserved until next stage/init
+
+    def advance_stage(self):
+        """Call when operator stage advances to next pick point. Clears sticky for new stage."""
+        self._snap_fresh   = None
+        self._snap_current = None
+        self._snap_sticky  = None
+        self._snap_sticky_stage = None
+        self._snap_sticky_mode  = None
+        self._snap_sticky_xy    = None
+        self._snap_state = "IDLE"
+
+    def reset_snap_state(self):
+        """Full reset (cancel / finish)."""
+        self.init_snap_state()
+
+    @property
+    def snap_state(self) -> str:
+        return getattr(self, "_snap_state", "IDLE")
+
+    @property
+    def is_sticky(self) -> bool:
+        return self._snap_state in ("STICKY_SNAP",)
+
+    def snap_state_label(self) -> str:
+        labels = {
+            "IDLE":          "待機",
+            "HOVER":         "懸停",
+            "LIVE_SNAP":     "即時吸附",
+            "STICKY_SNAP":   "🔒 鎖定最後有效點",
+            "CONFIRM_READY": "準備確認",
+            "CONFIRMED":     "已確認",
+        }
+        return labels.get(self._snap_state, self._snap_state)
+
+    def last_valid_type_label(self) -> str:
+        if self._snap_last_valid is None:
+            return "—"
+        snap_type = self._snap_last_valid.snap_type or "RAY"
+        labels = {
+            "VERTEX":      "頂點",
+            "MIDPOINT":    "邊中點",
+            "EDGE":        "邊",
+            "FACE_CENTER": "面中心",
+            "FACE":        "面",
+            "ORIGIN":      "物件原點",
+            "CENTER":      "中心",
+            "RAY":         "射線",
+        }
+        return labels.get(snap_type.upper(), snap_type)

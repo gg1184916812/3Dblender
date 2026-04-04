@@ -1,0 +1,362 @@
+"""
+Smart Align Pro - Screen-Space Snap Engine
+統一的 CAD 級吸附系統
+"""
+
+import bpy
+import math
+from math import hypot
+from mathutils import Vector
+from bpy_extras import view3d_utils
+from typing import Optional, Dict, Any, List, Tuple
+
+
+class SnapCandidate:
+    """吸附候選點"""
+    def __init__(self, location: Vector, snap_type: str, object=None, screen_distance: float = 0.0):
+        self.location = location
+        self.snap_type = snap_type
+        self.object = object
+        self.screen_distance = screen_distance
+        self.score = 0.0
+        
+    def calculate_score(self, mouse_x: float, mouse_y: float) -> float:
+        """計算候選點分數"""
+        # 基礎分數基於螢幕距離 - 更精確的衰減曲線
+        distance_score = max(0, 1.0 - (self.screen_distance / 60.0) ** 1.5)
+        
+        # 類型權重 - 更細膩的權重分配
+        type_weights = {
+            "VERTEX": 1.00,
+            "MIDPOINT": 0.90,
+            "EDGE": 0.75,
+            "FACE_CENTER": 0.65,
+            "FACE": 0.50,
+            "ORIGIN": 0.80
+        }
+        
+        type_weight = type_weights.get(self.snap_type, 0.5)
+        
+        # 距離權重 - 近距離加分
+        proximity_bonus = max(0, 1.0 - self.screen_distance / 30.0) * 0.2
+        
+        # 綜合分數
+        self.score = (distance_score * type_weight) + proximity_bonus
+        return self.score
+
+
+class StickySnapController:
+    """黏著吸附控制器 - 防止 snap 抖動和亂跳"""
+    def __init__(self):
+        self.locked_target = None
+        self.lock_distance = 0.0
+        self.release_distance = 25.0
+
+    def update(self, new_target, distance):
+        if self.locked_target is None:
+            self.locked_target = new_target
+            self.lock_distance = distance
+            return new_target
+
+        if distance < self.lock_distance * 1.2:
+            return self.locked_target
+
+        if distance > self.release_distance:
+            self.locked_target = None
+            return None
+
+        return self.locked_target
+
+    def reset(self):
+        self.locked_target = None
+        self.lock_distance = 0.0
+
+
+class CandidateCache:
+    """候選點緩存系統 - 避免亂跳"""
+    def __init__(self):
+        self.current_target: Optional[SnapCandidate] = None
+        self.last_best: Optional[SnapCandidate] = None
+        self.hysteresis_factor = 1.15  # 新目標需要比當前目標好 15% 才切換
+        self.sticky_radius = 18.0  # 脫附半徑（像素）
+        self.switch_cooldown = 0.1  # 切換冷卻時間（秒）
+        self.last_switch_time = 0.0
+        self.sticky_threshold = 15.0  # 黏著鎖定閾值
+        
+    def should_switch_target(self, new_candidate: SnapCandidate, mouse_x: float, mouse_y: float) -> bool:
+        """判斷是否應該切換目標"""
+        import time
+        current_time = time.time()
+        
+        if self.current_target is None:
+            return True
+            
+        # 檢查切換冷卻時間
+        if current_time - self.last_switch_time < self.switch_cooldown:
+            return False
+        
+        # 如果有 last_best 且距離足夠近，保持當前吸附
+        if self.last_best:
+            distance_to_last = new_candidate.screen_distance
+            if distance_to_last < self.sticky_threshold:
+                return False
+        
+        # 檢查是否在當前目標的黏著範圍內
+        if self.current_target.screen_distance < self.sticky_radius:
+            return False
+            
+        # 檢查新目標分數是否足夠高
+        if new_candidate.score > self.current_target.score * self.hysteresis_factor:
+            self.last_switch_time = current_time
+            self.last_best = new_candidate
+            return True
+            
+        return False
+        
+    def update_target(self, candidate: Optional[SnapCandidate]):
+        """更新當前目標"""
+        self.current_target = candidate
+        if candidate:
+            self.last_best = candidate
+
+
+class StickyRelease:
+    """黏著釋放系統 - 手感關鍵"""
+    def __init__(self):
+        self.release_threshold = 20.0  # 釋放閾值（像素）
+        self.switch_threshold = 25.0   # 切換閾值（像素）
+        self.last_target: Optional[SnapCandidate] = None
+        self.accumulated_distance = 0.0
+        self.last_mouse_pos = (0.0, 0.0)
+        
+    def should_release(self, current_candidate: SnapCandidate, mouse_x: float, mouse_y: float) -> bool:
+        """判斷是否應該釋放當前目標"""
+        if self.last_target is None:
+            self.last_target = current_candidate
+            self.last_mouse_pos = (mouse_x, mouse_y)
+            return False
+            
+        # 計算滑鼠移動距離
+        mouse_distance = hypot(mouse_x - self.last_mouse_pos[0], mouse_y - self.last_mouse_pos[1])
+        self.accumulated_distance += mouse_distance
+        self.last_mouse_pos = (mouse_x, mouse_y)
+        
+        # 檢查是否超過釋放閾值
+        if self.accumulated_distance > self.release_threshold:
+            self.accumulated_distance = 0.0
+            return True
+            
+        return False
+
+
+class SnapEngine:
+    """統一的 Screen-Space Snap Engine"""
+    def __init__(self):
+        self.candidate_cache = CandidateCache()
+        self.sticky_release = StickyRelease()
+        
+        # 默認吸附閾值（像素）- 將由設置系統更新
+        # ×1.5 擴大吸附範圍，提升手感
+        self.snap_radii = {
+            "VERTEX": 30,      # 20 * 1.5
+            "MIDPOINT": 27,    # 18 * 1.5
+            "EDGE": 21,        # 14 * 1.5
+            "FACE_CENTER": 33, # 22 * 1.5
+            "FACE": 39,        # 26 * 1.5
+            "ORIGIN": 36       # 24 * 1.5
+        }
+        
+        # 應用設置
+        self._apply_settings()
+        
+    def _apply_settings(self):
+        """應用用戶設置"""
+        try:
+            if not hasattr(bpy.context, 'scene') or not bpy.context.scene:
+                return
+            from ..utils.settings import get_snap_settings, apply_settings_to_snap_engine
+            apply_settings_to_snap_engine(self)
+        except (ImportError, AttributeError):
+            pass
+        
+    def raycast_and_get_candidates(self, context, mouse_x: float, mouse_y: float) -> List[SnapCandidate]:
+        """執行 ray_cast 並獲取所有候選點"""
+        region = context.region
+        rv3d = context.space_data.region_3d
+        
+        if not region or not rv3d:
+            return []
+            
+        # 執行 ray_cast
+        coord = (mouse_x, mouse_y)
+        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        
+        depsgraph = context.evaluated_depsgraph_get()
+        hit, location, normal, face_index, obj, matrix = context.scene.ray_cast(depsgraph, origin, direction)
+        
+        if not hit:
+            return []
+            
+        candidates = []
+        
+        # 添加面中心候選
+        face_center = self._get_face_center(obj, face_index)
+        if face_center:
+            screen_dist = self._get_screen_distance(region, rv3d, face_center, mouse_x, mouse_y)
+            candidates.append(SnapCandidate(face_center, "FACE_CENTER", obj, screen_dist))
+        
+        # 添加頂點候選
+        vertices = self._get_face_vertices(obj, face_index)
+        for vertex in vertices:
+            screen_dist = self._get_screen_distance(region, rv3d, vertex, mouse_x, mouse_y)
+            candidates.append(SnapCandidate(vertex, "VERTEX", obj, screen_dist))
+        
+        # 添加邊中點候選
+        edges = self._get_face_edges(obj, face_index)
+        for edge_mid in edges:
+            screen_dist = self._get_screen_distance(region, rv3d, edge_mid, mouse_x, mouse_y)
+            candidates.append(SnapCandidate(edge_mid, "MIDPOINT", obj, screen_dist))
+            
+        # 添加物件原點候選
+        obj_origin = obj.matrix_world.translation
+        screen_dist = self._get_screen_distance(region, rv3d, obj_origin, mouse_x, mouse_y)
+        candidates.append(SnapCandidate(obj_origin, "ORIGIN", obj, screen_dist))
+        
+        return candidates
+        
+    def find_best_candidate(self, context, mouse_x: float, mouse_y: float) -> Optional[SnapCandidate]:
+        """找到最佳候選點"""
+        candidates = self.raycast_and_get_candidates(context, mouse_x, mouse_y)
+        
+        if not candidates:
+            self.candidate_cache.update_target(None)
+            self._last_candidate_distance = float('inf')
+            return None
+            
+        # 檢查是否在外部空區（沒有幾何體的區域）
+        if self._is_in_empty_space(context, mouse_x, mouse_y):
+            # 在外部空區時，降低吸附強度
+            self.candidate_cache.update_target(None)
+            self._last_candidate_distance = float('inf')
+            return None
+            
+        # 計算所有候選點的分數
+        for candidate in candidates:
+            candidate.calculate_score(mouse_x, mouse_y)
+            
+        # 按分數排序
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        
+        # 選擇最佳候選點
+        best_candidate = candidates[0]
+        self._last_candidate_distance = best_candidate.screen_distance
+        
+        # 檢查是否應該切換目標
+        if self.candidate_cache.should_switch_target(best_candidate, mouse_x, mouse_y):
+            self.candidate_cache.update_target(best_candidate)
+            
+        # 檢查是否應該釋放
+        if self.sticky_release.should_release(best_candidate, mouse_x, mouse_y):
+            self.candidate_cache.update_target(None)
+            return None
+            
+        return self.candidate_cache.current_target
+        
+    def _is_in_empty_space(self, context, mouse_x: float, mouse_y: float) -> bool:
+        """檢查滑鼠是否在外部空區 - 漸進式容忍策略"""
+        region = context.region
+        rv3d = context.space_data.region_3d
+        
+        if not region or not rv3d:
+            return False
+            
+        coord = (mouse_x, mouse_y)
+        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        
+        depsgraph = context.evaluated_depsgraph_get()
+        
+        # 多層次檢測，從遠到近
+        distances = [0.5, 0.2, 0.1, 0.05]  # 500mm, 200mm, 100mm, 50mm
+        hit_count = 0
+        
+        for dist in distances:
+            short_direction = direction.normalized() * dist
+            hit, _, _, _, _, _ = context.scene.ray_cast(depsgraph, origin, short_direction)
+            if hit:
+                hit_count += 1
+                
+        # 只有在所有距離都沒命中時才認為是外部空區
+        # 並且需要考慮當前候選點的距離
+        if hit_count == 0:
+            # 檢查是否有候選點在合理範圍內
+            if hasattr(self, '_last_candidate_distance'):
+                # 如果上次候選點距離很近，不認為是外部空區
+                if self._last_candidate_distance < 100:  # 100px 內
+                    return False
+            return True
+            
+        return False
+        
+    def _get_face_center(self, obj, face_index: int) -> Optional[Vector]:
+        """獲取面中心"""
+        if face_index < 0 or face_index >= len(obj.data.polygons):
+            return None
+            
+        face = obj.data.polygons[face_index]
+        center = Vector((0, 0, 0))
+        
+        for vertex_index in face.vertices:
+            center += obj.data.vertices[vertex_index].co
+            
+        center /= len(face.vertices)
+        return obj.matrix_world @ center
+        
+    def _get_face_vertices(self, obj, face_index: int) -> List[Vector]:
+        """獲取面的頂點"""
+        if face_index < 0 or face_index >= len(obj.data.polygons):
+            return []
+            
+        face = obj.data.polygons[face_index]
+        vertices = []
+        
+        for vertex_index in face.vertices:
+            vertex = obj.data.vertices[vertex_index].co
+            vertices.append(obj.matrix_world @ vertex)
+            
+        return vertices
+        
+    def _get_face_edges(self, obj, face_index: int) -> List[Vector]:
+        """獲取面的邊中點"""
+        if face_index < 0 or face_index >= len(obj.data.polygons):
+            return []
+            
+        face = obj.data.polygons[face_index]
+        edge_midpoints = []
+        
+        for i in range(len(face.vertices)):
+            v1_idx = face.vertices[i]
+            v2_idx = face.vertices[(i + 1) % len(face.vertices)]
+            
+            v1 = obj.data.vertices[v1_idx].co
+            v2 = obj.data.vertices[v2_idx].co
+            
+            midpoint = (v1 + v2) / 2
+            edge_midpoints.append(obj.matrix_world @ midpoint)
+            
+        return edge_midpoints
+        
+    def _get_screen_distance(self, region, rv3d, location: Vector, mouse_x: float, mouse_y: float) -> float:
+        """計算螢幕距離"""
+        try:
+            pt2d = view3d_utils.location_3d_to_region_2d(region, rv3d, location)
+            if pt2d is None:
+                return float('inf')
+            return hypot(pt2d.x - mouse_x, pt2d.y - mouse_y)
+        except Exception:
+            return float('inf')
+
+
+# 全局 snap engine 實例
+snap_engine = SnapEngine()
